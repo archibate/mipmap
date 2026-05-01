@@ -418,8 +418,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("-e", "--endpoint",
                    default=os.environ.get("MIPMAP_ENDPOINT", DEFAULT_ENDPOINT))
     p.add_argument("-f", "--format",
-                   default=os.environ.get("MIPMAP_FORMAT", "plain"),
-                   choices=["plain", "color", "color-256", "jsonl"])
+                   default=os.environ.get("MIPMAP_FORMAT", "auto"),
+                   choices=["auto", "plain", "color", "color-256", "jsonl"],
+                   help="output format (default 'auto': color-256 if stdout is "
+                        "a TTY and NO_COLOR isn't set, else plain; jsonl never "
+                        "auto-selected)")
     p.add_argument("--floor", type=_positive_int,
                    default=(int(os.environ["MIPMAP_FLOOR"]) if os.environ.get("MIPMAP_FLOOR") else None),
                    help=f"smallest level's target size in units (words for "
@@ -484,7 +487,15 @@ def read_input(path: str | None) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    if os.environ.get("NO_COLOR") and args.format in ("color", "color-256"):
+    if args.format == "auto":
+        if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+            args.format = "plain"
+        else:
+            term = os.environ.get("TERM", "")
+            # Most modern terminals support 256-color even if $TERM is just
+            # "xterm". Fall back to 16-color only on truly minimal terminals.
+            args.format = "color" if term in ("dumb", "vt100", "vt220", "ansi", "") else "color-256"
+    elif os.environ.get("NO_COLOR") and args.format in ("color", "color-256"):
         args.format = "plain"
 
     src = read_input(args.file)

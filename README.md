@@ -48,9 +48,10 @@ cat article.md | mipmap
 mipmap article.md
 ```
 
-输出格式有四种，默认是 `plain`（原始格式，带分隔符）：
+输出格式默认是 `auto`：在终端里直接看就用 `color-256`，被管道接走或检测到 `NO_COLOR` 时降级为 `plain`，机器解析需要 `jsonl` 时显式指定即可。
 
 ```bash
+mipmap article.md                 # auto：终端里渲染 color-256，piped 自动降级为 plain
 mipmap article.md -f plain        # 原始：带 --- LEVEL N --- 分隔符，方便管道处理
 mipmap article.md -f color        # 16 色：第一层最亮，往下逐渐变暗
 mipmap article.md -f color-256    # 256 色渐变：从亮到暗的平滑过渡
@@ -105,7 +106,7 @@ mipmap: source 1234 字, computing 4 levels: 30, 75, 188, 370 (qwen2.5-coder:14b
 |---|---|---|
 | `-m`, `--model` | `qwen2.5-coder:14b` | ollama 模型名 |
 | `-e`, `--endpoint` | `http://localhost:11434` | ollama 服务地址 |
-| `-f`, `--format` | `plain` | 输出格式：`plain` / `color` / `color-256` / `jsonl` |
+| `-f`, `--format` | `auto` | 输出格式：`auto` / `plain` / `color` / `color-256` / `jsonl`。`auto` 会在终端里自动选 `color-256`，被管道接走时降级为 `plain`，`NO_COLOR` 也尊重 |
 | `-c`, `--compression` | `0.3` | 最长一层的压缩比，默认源文本的 30%。范围 `(0, 1]` |
 | `--ratio` | `2.5` | 相邻两层之间的字数倍数。`> 1` 任意取值。`1.5` 是更细的阶梯，`3` 跳得更快。默认 `2.5` 略大于"翻倍"，为了对冲模型实际输出比目标偏小的倾向，使读者感受到的层级落差接近 2× |
 | `--max-levels` | `7` | 自动模式下的层级上限。再长的文本也不会超过 7 层 |
