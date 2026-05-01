@@ -439,7 +439,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("-c", "--compression", type=float,
                    default=float(os.environ.get("MIPMAP_COMPRESSION", DEFAULT_COMPRESSION)))
     p.add_argument("--max-levels", type=int,
-                   default=int(os.environ.get("MIPMAP_MAX_LEVELS", DEFAULT_MAX_LEVELS)))
+                   default=int(os.environ.get("MIPMAP_MAX_LEVELS", DEFAULT_MAX_LEVELS)),
+                   help="cap on auto-computed level count (default "
+                        f"{DEFAULT_MAX_LEVELS}); ignored if --levels is set")
+    p.add_argument("--levels", type=int, default=None,
+                   help="force exactly N levels by doubling from --floor "
+                        "(e.g. --levels 3 with default floor=20 → [20, 40, 80]); "
+                        "overrides --max-levels and the auto-compression cap")
     p.add_argument("-t", "--temperature", type=float,
                    default=float(os.environ.get("MIPMAP_TEMP", DEFAULT_TEMP)))
     p.add_argument("--seed", type=int, default=None)
@@ -510,7 +516,11 @@ def main(argv: list[str] | None = None) -> int:
     a, c = count_units(src)
     units = a + c
     floor = args.floor if args.floor else (DEFAULT_FLOOR_CJK if cjk else DEFAULT_FLOOR_LATIN)
-    levels = calibrated_levels(units, floor, args.compression, args.max_levels)
+    if args.levels is not None and args.levels > 0:
+        # Explicit override: doubling sequence from floor, exactly N entries.
+        levels = [floor * (2 ** i) for i in range(args.levels)]
+    else:
+        levels = calibrated_levels(units, floor, args.compression, args.max_levels)
 
     if not levels or (len(levels) == 1 and levels[0] >= units):
         if args.verbose:

@@ -110,7 +110,8 @@ mipmap: source 1234 字, computing 4 levels: 30, 60, 120, 185 (qwen2.5-coder:14b
 | `-e`, `--endpoint` | `http://localhost:11434` | ollama 服务地址 |
 | `-f`, `--format` | `plain` | 输出格式：`plain` / `color` / `color-256` / `jsonl` |
 | `-c`, `--compression` | `0.15` | 最长一层的压缩比，默认源文本的 15% |
-| `--max-levels` | `7` | 层级上限。再长的文本也不会超过 7 层 |
+| `--max-levels` | `7` | 自动模式下的层级上限。再长的文本也不会超过 7 层 |
+| `--levels` | auto | 强制指定层级数量。例如 `--levels 3` 会从 `--floor` 开始翻倍生成 3 层（默认 floor=20 → `[20, 40, 80]`）。指定后会忽略 `--max-levels` 和 `--compression` |
 | `--floor` | 20 / 30 | 最短一层（TLDR）的长度，英文按词、中文按字。默认英文 20 词、中文 30 字。调大就是要一个更"厚"的 TLDR，也会让整体层级数量减少 |
 | `-t`, `--temperature` | `0.4` | 采样温度 |
 | `--seed` | 随机 | 固定种子用于复现 |
