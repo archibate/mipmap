@@ -27,8 +27,17 @@ from typing import Iterator
 
 # --- defaults ----------------------------------------------------------------
 
+DEFAULT_PROVIDER = "ollama"
 DEFAULT_MODEL = "qwen2.5-coder:14b"
 DEFAULT_ENDPOINT = "http://localhost:11434"
+# OpenAI-compatible defaults (also works with OpenRouter, Together, Groq,
+# DeepSeek, Mistral, vLLM, llama.cpp's server, LM Studio, etc.)
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1"
+# Conservative input-budget default for openai-compat: 32K covers most
+# hosted models without inviting huge-prompt cost surprises. Override with
+# --num-ctx for 128K models.
+DEFAULT_OPENAI_NUM_CTX = 32768
 DEFAULT_FLOOR_LATIN = 20
 DEFAULT_FLOOR_CJK = 30
 DEFAULT_COMPRESSION = 0.3
@@ -124,11 +133,15 @@ def later_instruction(prior_level: int) -> str:
         f"The output must be visibly longer than LEVEL {prior_level}."
     )
 
-def make_prompt(src: str, levels: list[int], cjk: bool) -> str:
+def make_prompt(src: str, levels: list[int], cjk: bool,
+                 user_prompt: str | None = None) -> str:
     """Build the LLM prompt. Always English-language instructions — the model
     follows them more reliably than Chinese instructions, and naturally
     responds in the source's language regardless of the prompt language.
-    The `cjk` flag only affects the per-level unit label (字 vs. words)."""
+    The `cjk` flag only affects the per-level unit label (字 vs. words).
+    `user_prompt` is optional extra guidance from the caller (e.g. focus
+    hints, audience, terminology preferences) inserted between the source
+    and the output-format spec."""
     unit_label = "字" if cjk else "w"
     spec = ", ".join(f"LEVEL {i+1} (~{w}{unit_label})" for i, w in enumerate(levels))
     intro = [
@@ -171,7 +184,21 @@ def make_prompt(src: str, levels: list[int], cjk: bool) -> str:
         instr = L1_EN if i == 0 else later_instruction(i)
         outro.append(f"LEVEL {i+1}: approximately {w} {unit_label}. " + instr)
     outro += ["", "Begin output now (start with `--- LEVEL 1 ---`)."]
-    return "\n".join(intro + ["", "<source>", src, "</source>"] + outro)
+    user_section: list[str] = []
+    if user_prompt and user_prompt.strip():
+        user_section = [
+            "",
+            "—— ADDITIONAL INSTRUCTIONS FROM THE USER ——",
+            "",
+            "Follow these in addition to the rules above. They MUST NOT "
+            "override the output format (delimiters, level count, no code "
+            "fences) — only the content and emphasis of each level.",
+            "",
+            user_prompt.strip(),
+        ]
+    return "\n".join(
+        intro + ["", "<source>", src, "</source>"] + user_section + outro
+    )
 
 # --- ollama streaming --------------------------------------------------------
 
@@ -193,8 +220,8 @@ def query_model_num_ctx(endpoint: str, model: str, timeout: float = 2.0) -> int 
     return int(m.group(1)) if m else None
 
 
-def stream_raw(endpoint: str, model: str, prompt: str, temperature: float,
-               seed: int | None, num_ctx: int) -> Iterator[str]:
+def stream_ollama(endpoint: str, model: str, prompt: str, temperature: float,
+                   seed: int | None, num_ctx: int) -> Iterator[str]:
     options: dict = {"temperature": temperature, "num_ctx": num_ctx}
     if seed is not None:
         options["seed"] = seed
@@ -218,6 +245,49 @@ def stream_raw(endpoint: str, model: str, prompt: str, temperature: float,
                 yield chunk
             if obj.get("done"):
                 return
+
+
+def stream_openai(endpoint: str, model: str, prompt: str, temperature: float,
+                   seed: int | None, api_key: str | None) -> Iterator[str]:
+    """Stream from an OpenAI-compatible /v1/chat/completions SSE endpoint.
+
+    Compatible with OpenAI, OpenRouter, Together, Groq, DeepSeek, Mistral,
+    plus self-hosted servers like vLLM, llama.cpp's server, and LM Studio.
+    Does not send num_ctx — that's an ollama-only knob; openai-compat models
+    have a fixed context per model.
+    """
+    payload: dict = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+        "temperature": temperature,
+    }
+    if seed is not None:
+        payload["seed"] = seed
+    body = json.dumps(payload).encode()
+    url = endpoint.rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=body, headers=headers)
+    with urllib.request.urlopen(req) as r:
+        for raw_line in r:
+            line = raw_line.strip()
+            if not line or not line.startswith(b"data:"):
+                continue
+            data = line[5:].lstrip()
+            if data == b"[DONE]":
+                return
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            chunk = (choices[0].get("delta") or {}).get("content", "")
+            if chunk:
+                yield chunk
 
 
 def strip_fences(raw_iter: Iterator[str]) -> Iterator[str]:
@@ -413,10 +483,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     "the model won't enumerate table rows during summarization.",
     )
     p.add_argument("file", nargs="?", help="input file (default: stdin)")
+    p.add_argument("--provider",
+                   default=os.environ.get("MIPMAP_PROVIDER", DEFAULT_PROVIDER),
+                   choices=["ollama", "openai"],
+                   help=f"LLM backend; 'openai' covers any OpenAI-compatible "
+                        f"/v1/chat/completions endpoint (OpenAI, OpenRouter, "
+                        f"Together, Groq, DeepSeek, vLLM, llama.cpp server, "
+                        f"LM Studio). Default {DEFAULT_PROVIDER}")
     p.add_argument("-m", "--model",
-                   default=os.environ.get("MIPMAP_MODEL", DEFAULT_MODEL))
+                   default=os.environ.get("MIPMAP_MODEL"),
+                   help=f"model name; default {DEFAULT_MODEL!r} for ollama, "
+                        f"{DEFAULT_OPENAI_MODEL!r} for openai")
     p.add_argument("-e", "--endpoint",
-                   default=os.environ.get("MIPMAP_ENDPOINT", DEFAULT_ENDPOINT))
+                   default=os.environ.get("MIPMAP_ENDPOINT"),
+                   help=f"API endpoint; default {DEFAULT_ENDPOINT!r} for "
+                        f"ollama, {DEFAULT_OPENAI_ENDPOINT!r} for openai "
+                        f"(OPENAI_BASE_URL env var also honored)")
+    p.add_argument("--api-key",
+                   default=(os.environ.get("MIPMAP_API_KEY")
+                            or os.environ.get("OPENAI_API_KEY")),
+                   help="API key for openai provider; default from "
+                        "MIPMAP_API_KEY or OPENAI_API_KEY env. Local "
+                        "openai-compat servers usually don't need one.")
     p.add_argument("-f", "--format",
                    default=os.environ.get("MIPMAP_FORMAT", "auto"),
                    choices=["auto", "plain", "color", "color-256", "jsonl"],
@@ -457,6 +545,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=None,
                    help="random seed for the model; default unset (random). "
                         "Pin a value for reproducible output.")
+    p.add_argument("-p", "--prompt",
+                   default=os.environ.get("MIPMAP_PROMPT"),
+                   help="additional instructions for the model, e.g. "
+                        "'focus on security implications' or 'audience is "
+                        "non-technical'. Inserted between the source and the "
+                        "output-format spec; cannot override delimiters or "
+                        "level count.")
     p.add_argument("--max-chars", type=int,
                    default=(int(os.environ["MIPMAP_MAX_CHARS"])
                             if os.environ.get("MIPMAP_MAX_CHARS") else -1),
@@ -467,9 +562,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--num-ctx", type=int,
                    default=(int(os.environ["MIPMAP_NUM_CTX"])
                             if os.environ.get("MIPMAP_NUM_CTX") else -1),
-                   help="ollama context window in tokens; default queries the "
-                        "model's modelfile via /api/show, falling back to "
-                        f"{FALLBACK_NUM_CTX} if the query fails")
+                   help="context window in tokens. For ollama, also sent as "
+                        "the runtime num_ctx and defaults to the modelfile "
+                        f"value via /api/show (fallback {FALLBACK_NUM_CTX}). "
+                        "For openai-compat, used only for --max-chars input "
+                        f"budgeting, default {DEFAULT_OPENAI_NUM_CTX}.")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="print stderr diagnostic showing source size, level "
                         "targets, and chosen model")
@@ -486,6 +583,18 @@ def read_input(path: str | None) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    # Provider-aware defaults for endpoint and model. Resolve here, after
+    # parsing, so the choice of provider drives them.
+    if args.endpoint is None:
+        if args.provider == "openai":
+            args.endpoint = (os.environ.get("OPENAI_BASE_URL")
+                              or DEFAULT_OPENAI_ENDPOINT)
+        else:
+            args.endpoint = DEFAULT_ENDPOINT
+    if args.model is None:
+        args.model = (DEFAULT_OPENAI_MODEL if args.provider == "openai"
+                      else DEFAULT_MODEL)
 
     if args.format == "auto":
         if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
@@ -505,16 +614,23 @@ def main(argv: list[str] | None = None) -> int:
 
     cjk = is_cjk_dominant(src)
 
-    # Resolve num_ctx: query the model's modelfile if the user didn't specify.
+    # Resolve num_ctx. Ollama path queries the modelfile; openai-compat
+    # uses a fixed default since there's no portable way to introspect it
+    # and num_ctx isn't sent in the request anyway (only used for the
+    # --max-chars budget calculation).
     num_ctx_source = "explicit"
     if args.num_ctx < 0:
-        detected = query_model_num_ctx(args.endpoint, args.model)
-        if detected is not None:
-            args.num_ctx = detected
-            num_ctx_source = f"modelfile ({args.model})"
+        if args.provider == "openai":
+            args.num_ctx = DEFAULT_OPENAI_NUM_CTX
+            num_ctx_source = "openai default"
         else:
-            args.num_ctx = FALLBACK_NUM_CTX
-            num_ctx_source = "fallback"
+            detected = query_model_num_ctx(args.endpoint, args.model)
+            if detected is not None:
+                args.num_ctx = detected
+                num_ctx_source = f"modelfile ({args.model})"
+            else:
+                args.num_ctx = FALLBACK_NUM_CTX
+                num_ctx_source = "fallback"
 
     if args.max_chars < 0:
         # Auto-scale based on language and num_ctx.
@@ -561,14 +677,19 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(
             f"mipmap: source {units} {unit_label}, computing {len(levels)} "
             f"{level_word}: {levels_str} "
-            f"({args.model}, num_ctx={args.num_ctx} from {num_ctx_source})\n"
+            f"({args.provider}/{args.model}, "
+            f"num_ctx={args.num_ctx} from {num_ctx_source})\n"
         )
 
-    prompt = make_prompt(src, levels, cjk)
+    prompt = make_prompt(src, levels, cjk, args.prompt)
 
     try:
-        raw = stream_raw(args.endpoint, args.model, prompt,
-                          args.temperature, args.seed, args.num_ctx)
+        if args.provider == "openai":
+            raw = stream_openai(args.endpoint, args.model, prompt,
+                                 args.temperature, args.seed, args.api_key)
+        else:
+            raw = stream_ollama(args.endpoint, args.model, prompt,
+                                 args.temperature, args.seed, args.num_ctx)
         defenced = strip_fences(raw)
 
         if args.format == "plain":
@@ -608,9 +729,34 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stdout.write("".join(raw_buffer))
                 if raw_buffer and not raw_buffer[-1].endswith("\n"):
                     sys.stdout.write("\n")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace").strip()
+        sys.stderr.write(
+            f"mipmap: HTTP {e.code} from {args.provider} at {args.endpoint}\n"
+        )
+        if body:
+            sys.stderr.write(f"mipmap: response body: {body}\n")
+        if args.provider == "openai" and e.code in (401, 403):
+            sys.stderr.write(
+                "mipmap: hint — set --api-key or OPENAI_API_KEY (or "
+                "MIPMAP_API_KEY).\n"
+            )
+        elif args.provider == "openai" and e.code == 404:
+            sys.stderr.write(
+                f"mipmap: hint — check --model {args.model!r} exists at this "
+                f"endpoint and that --endpoint includes /v1.\n"
+            )
+        return 1
     except urllib.error.URLError as e:
-        sys.stderr.write(f"mipmap: cannot reach ollama at {args.endpoint}: {e}\n")
-        sys.stderr.write("mipmap: hint — is ollama running? `ollama serve`\n")
+        sys.stderr.write(
+            f"mipmap: cannot reach {args.provider} at {args.endpoint}: {e}\n"
+        )
+        if args.provider == "ollama":
+            sys.stderr.write("mipmap: hint — is ollama running? `ollama serve`\n")
+        else:
+            sys.stderr.write(
+                "mipmap: hint — check --endpoint URL and network connectivity.\n"
+            )
         return 1
     except KeyboardInterrupt:
         sys.stdout.write("\n\033[0m")
