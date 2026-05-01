@@ -7,9 +7,10 @@
 
 Reads text from stdin (or a file) and emits a stack of summaries at
 progressively larger sizes, smallest first. Inspired by texture mipmaps:
-each level roughly doubles in size, capped at ~15% of the source. The
-1-sentence headline appears in ~1s on a warm local model; further levels
-stream in behind it. Stop reading whenever you have enough.
+each level grows by --ratio over the prior, capped at --compression of
+the source. The 1-sentence headline appears in ~1s on a warm local
+model; further levels stream in behind it. Stop reading whenever you
+have enough.
 
 Defaults target qwen2.5-coder:14b on a local ollama at localhost:11434.
 """
@@ -444,14 +445,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--levels", type=_positive_int, default=None,
                    help="force exactly N levels (must be > 0) by geometric "
                         "growth from --floor at --ratio (e.g. --levels 3 "
-                        "with default floor=20 ratio=2 → [20, 40, 80]); "
+                        "with default floor=20 ratio=2.5 → [20, 50, 125]); "
                         "overrides --max-levels and the auto-compression cap")
     p.add_argument("-t", "--temperature", type=_temperature,
                    default=float(os.environ.get("MIPMAP_TEMP", DEFAULT_TEMP)),
                    help=f"sampling temperature in [0.0, 2.0] "
                         f"(default {DEFAULT_TEMP:g})")
-    p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--lang", default="auto", choices=["auto", "en", "zh"])
+    p.add_argument("--seed", type=int, default=None,
+                   help="random seed for the model; default unset (random). "
+                        "Pin a value for reproducible output.")
+    p.add_argument("--lang", default="auto", choices=["auto", "en", "zh"],
+                   help="source language hint; affects only the default "
+                        "--floor (20 words for en / 30 chars for zh) and the "
+                        "diagnostic label. Default 'auto' detects by CJK "
+                        "character ratio; the model auto-responds in the "
+                        "source's language regardless.")
     p.add_argument("--max-chars", type=int,
                    default=(int(os.environ["MIPMAP_MAX_CHARS"])
                             if os.environ.get("MIPMAP_MAX_CHARS") else -1),
