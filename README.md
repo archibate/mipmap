@@ -2,7 +2,7 @@
 
 > 渐进式 TLDR——让长 AI 回答和长文章变得可以"快速浏览"。
 
-`mipmap` 把任意一段长文本变成一组由短到长的摘要：从一句话的浓缩开始，每一层是前一层的两倍，最长一层接近原文的 15%。读者从最短的开始扫，觉得够了就停，想了解更多就继续往下读。整套过程由本地 LLM（默认是 ollama 上的 qwen2.5-coder:14b）流式生成，最短的 TLDR 大约 1 秒就能看到。
+`mipmap` 把任意一段长文本变成一组由短到长的摘要：从一句话的浓缩开始，每一层是前一层的几倍（默认 2.5×），最长一层接近原文的 30%。读者从最短的开始扫，觉得够了就停，想了解更多就继续往下读。整套过程由本地 LLM（默认是 ollama 上的 qwen2.5-coder:14b）流式生成，最短的 TLDR 大约 1 秒就能看到。
 
 灵感来自计算机图形学里的 mipmap 纹理压缩——每一级的分辨率是上一级的一半。文本的"分辨率"则用词数（英文）或字符数（中文）衡量。
 
@@ -109,9 +109,10 @@ mipmap: source 1234 字, computing 4 levels: 30, 60, 120, 185 (qwen2.5-coder:14b
 | `-m`, `--model` | `qwen2.5-coder:14b` | ollama 模型名 |
 | `-e`, `--endpoint` | `http://localhost:11434` | ollama 服务地址 |
 | `-f`, `--format` | `plain` | 输出格式：`plain` / `color` / `color-256` / `jsonl` |
-| `-c`, `--compression` | `0.15` | 最长一层的压缩比，默认源文本的 15% |
+| `-c`, `--compression` | `0.3` | 最长一层的压缩比，默认源文本的 30%。范围 `(0, 1]` |
+| `--ratio` | `2.5` | 相邻两层之间的字数倍数。`> 1` 任意取值。`1.5` 是更细的阶梯，`3` 跳得更快 |
 | `--max-levels` | `7` | 自动模式下的层级上限。再长的文本也不会超过 7 层 |
-| `--levels` | auto | 强制指定层级数量。例如 `--levels 3` 会从 `--floor` 开始翻倍生成 3 层（默认 floor=20 → `[20, 40, 80]`）。指定后会忽略 `--max-levels` 和 `--compression` |
+| `--levels` | auto | 强制指定层级数量。从 `--floor` 开始按 `--ratio` 几何增长，例如 `--levels 3 --floor 20 --ratio 2.5` → `[20, 50, 125]`。指定后会忽略 `--max-levels` 和 `--compression` |
 | `--floor` | 20 / 30 | 最短一层（TLDR）的长度，英文按词、中文按字。默认英文 20 词、中文 30 字。调大就是要一个更"厚"的 TLDR，也会让整体层级数量减少 |
 | `-t`, `--temperature` | `0.4` | 采样温度 |
 | `--seed` | 随机 | 固定种子用于复现 |
@@ -120,7 +121,7 @@ mipmap: source 1234 字, computing 4 levels: 30, 60, 120, 185 (qwen2.5-coder:14b
 | `--num-ctx` | auto | ollama 上下文窗口（tokens）。默认通过 `/api/show` 查询模型 modelfile 里的 `num_ctx`，查询失败时回落到 8192 |
 | `-v`, `--verbose` | | 打印 stderr 上的层级规划信息（默认安静） |
 
-环境变量也能设默认值：`MIPMAP_MODEL` / `MIPMAP_ENDPOINT` / `MIPMAP_FORMAT` / `MIPMAP_COMPRESSION` / `MIPMAP_MAX_CHARS` / `MIPMAP_NUM_CTX` 等。`NO_COLOR=1` 会自动把 color 模式降级为 plain（遵循 [no-color.org](https://no-color.org) 约定）。
+环境变量也能设默认值：`MIPMAP_MODEL` / `MIPMAP_ENDPOINT` / `MIPMAP_FORMAT` / `MIPMAP_COMPRESSION` / `MIPMAP_RATIO` / `MIPMAP_MAX_CHARS` / `MIPMAP_NUM_CTX` 等。`NO_COLOR=1` 会自动把 color 模式降级为 plain（遵循 [no-color.org](https://no-color.org) 约定）。
 
 ### 关于 num_ctx
 
@@ -153,7 +154,7 @@ ollama create qwen2.5-coder:14b -f /tmp/Modelfile
 
 - 短文本（< 20 词）：原样输出，不调用模型
 - 中等（20-266 词）：只生成一层 TLDR
-- 长文本：多层 mipmap，每层是前一层的两倍，直到接近 15% 上限
+- 长文本：多层 mipmap，每层是前一层的 `--ratio` 倍（默认 2.5），直到接近 `--compression` 上限（默认 30%）
 
 prompt 里有几个关键设计：
 

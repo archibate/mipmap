@@ -30,9 +30,9 @@ DEFAULT_MODEL = "qwen2.5-coder:14b"
 DEFAULT_ENDPOINT = "http://localhost:11434"
 DEFAULT_FLOOR_LATIN = 20
 DEFAULT_FLOOR_CJK = 30
-DEFAULT_COMPRESSION = 0.15
+DEFAULT_COMPRESSION = 0.3
 DEFAULT_MAX_LEVELS = 7
-DEFAULT_RATIO = 2.0  # each level is this many times the prior; mipmap-style doubling
+DEFAULT_RATIO = 2.5  # each level is this many times the prior
 DEFAULT_TEMP = 0.4
 # When --num-ctx is not given, mipmap queries the model's modelfile via
 # /api/show; this fallback is used only if that query fails.
@@ -519,8 +519,16 @@ def main(argv: list[str] | None = None) -> int:
     units = a + c
     floor = args.floor if args.floor else (DEFAULT_FLOOR_CJK if cjk else DEFAULT_FLOOR_LATIN)
     if args.levels is not None:
-        # Explicit override: geometric sequence from floor, exactly N entries.
-        levels = [round(floor * (args.ratio ** i)) for i in range(args.levels)]
+        # Explicit override: geometric growth from floor, exactly N entries.
+        # Enforce strictly increasing sizes (matches auto mode's max(n+1, n*ratio)).
+        levels = []
+        n = float(floor)
+        for _ in range(args.levels):
+            rounded = round(n)
+            if levels and rounded <= levels[-1]:
+                rounded = levels[-1] + 1
+            levels.append(rounded)
+            n = max(n + 1, n * args.ratio)
     else:
         levels = calibrated_levels(units, floor, args.compression,
                                     args.max_levels, args.ratio)
