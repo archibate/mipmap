@@ -1,0 +1,513 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""mipmap — progressive disclosure summarization via local LLM.
+
+Reads text from stdin (or a file) and emits a stack of summaries at
+progressively larger sizes, smallest first. Inspired by texture mipmaps:
+each level roughly doubles in size, capped at ~15% of the source. The
+1-sentence headline appears in ~1s on a warm local model; further levels
+stream in behind it. Stop reading whenever you have enough.
+
+Defaults target qwen2.5-coder:14b on a local ollama at localhost:11434.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from typing import Iterator
+
+# --- defaults ----------------------------------------------------------------
+
+DEFAULT_MODEL = "qwen2.5-coder:14b"
+DEFAULT_ENDPOINT = "http://localhost:11434"
+DEFAULT_FLOOR_LATIN = 20
+DEFAULT_FLOOR_CJK = 30
+DEFAULT_COMPRESSION = 0.15
+DEFAULT_MAX_LEVELS = 7
+DEFAULT_TEMP = 0.4
+INPUT_CHAR_CAP = 24000
+NUM_CTX = 8192
+
+# --- counters & detection ----------------------------------------------------
+
+ASCII_WORD = re.compile(r"[A-Za-z0-9]+(?:[-_'][A-Za-z0-9]+)*")
+CJK_CHAR = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿]")
+# Match a level marker line — be permissive about decorations.
+# Accepts "--- LEVEL 1 ---", "LEVEL 1", "## Level 1", "**LEVEL 1**", etc.
+# Must end with \n so we don't match partial lines while streaming.
+LVL_DELIM = re.compile(
+    r"^[\s\-=#*_~]*LEVEL\s+(\d+)\s*[\s\-=#*_~:]*\n",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Markdown horizontal rule that some models emit between label and content.
+LEADING_HR = re.compile(r"\A[-*=_]{3,}[ \t]*(?:\n|$)")
+# A line that is just a markdown code-fence (optionally with a language tag).
+# Some models wrap the entire mipmap in ```...``` despite the prompt; strip those.
+FENCE_LINE = re.compile(r"\A\s*```\w*\s*\Z")
+
+def count_units(s: str) -> tuple[int, int]:
+    return len(ASCII_WORD.findall(s)), len(CJK_CHAR.findall(s))
+
+def is_cjk_dominant(s: str, override: str = "auto") -> bool:
+    if override == "zh":
+        return True
+    if override == "en":
+        return False
+    a, c = count_units(s)
+    return (c / (a + c)) > 0.5 if (a + c) else False
+
+# --- level computation -------------------------------------------------------
+
+def calibrated_levels(units: int, floor: int, compression: float, cap: int) -> list[int]:
+    """Return target sizes per level, smallest first.
+
+    Behavior by source size:
+      units < floor:          [units]   — too short, pass through verbatim
+      ceiling < floor:        [floor]   — single TLDR; full mipmap not useful
+      otherwise:              [floor, 2*floor, 4*floor, ..., ceiling]
+    where ceiling = floor(units * compression).
+    """
+    if units <= 0:
+        return []
+    if units < floor:
+        return [units]
+    ceiling = int(units * compression)
+    if ceiling < floor:
+        return [floor]
+    out: list[int] = []
+    n = floor
+    while n <= ceiling and len(out) < cap:
+        out.append(n)
+        n *= 2
+    if out and out[-1] < ceiling and ceiling - out[-1] >= floor and len(out) < cap:
+        out.append(ceiling)
+    return out
+
+# --- prompt template ---------------------------------------------------------
+
+L1_EN = (
+    "Write ONE sentence — just one, no semicolons or periods combining ideas. "
+    "Convey the source's main claim, recommendation, finding, or definition. "
+    "Use declarative or imperative voice. Do not begin with topic-announcement "
+    "phrasing like 'The source discusses/presents/explores/describes/covers/"
+    "outlines/is about'. State the content directly, in your own voice."
+)
+
+LATER_EN = (
+    "REWRITE this level fresh from the source — do NOT extend the prior level "
+    "or copy its sentences. Each level is an independent summary at a new "
+    "target size, not the previous level plus extras. Include facts the prior "
+    "shorter level had to omit, with different wording."
+)
+
+L1_ZH = (
+    "写一句话——只一句，不要用分号或句号拼接两个意思。"
+    "概括原文的主要主张、建议、发现或定义。使用陈述句或祈使句。"
+    "不要用'原文讨论/介绍/探讨/描述/概述/涉及'之类的元描述开头。"
+    "直接陈述内容，用你自己的语气。"
+)
+
+LATER_ZH = (
+    "重新撰写这一层——不要在前一层基础上叠加，也不要复制前一层的句子。"
+    "每一层都是按新的字数目标独立写出的摘要，不是前一层再加内容。"
+    "补充前一层因长度限制未提及的事实，措辞要不同于前一层。"
+)
+
+def make_prompt(src: str, levels: list[int], cjk: bool) -> str:
+    if cjk:
+        spec = "、".join(f"LEVEL {i+1}（约{w}字）" for i, w in enumerate(levels))
+        intro = [
+            "你的任务是为下面的源文本生成一个 'mipmap' 摘要：一组长度逐级增大的摘要，"
+            "从最短的开始排列。",
+            "",
+            "原文中可能包含代码、表格、列表或其他结构化内容。"
+            "请用自然语言概括其含义，不要逐字复制。",
+        ]
+        if len(levels) >= 2:
+            fmt_lines = [
+                f"输出必须以一行 `--- LEVEL 1 ---` 开头，后跟 LEVEL 1 内容。"
+                f"接着一行 `--- LEVEL 2 ---`，后跟 LEVEL 2 内容。依此类推。"
+                "每个分隔符必须独占一行。"
+                "不要把输出包在 markdown 代码块（```）里，即使原文有也不要。"
+                "纯文本输出层级标记和内容即可。",
+            ]
+        else:
+            fmt_lines = [
+                "输出必须以一行 `--- LEVEL 1 ---` 开头，后跟 LEVEL 1 内容。只有一个层级。"
+                "不要把输出包在 markdown 代码块（```）里。纯文本输出即可。",
+            ]
+        outro = [
+            "",
+            "—— 输出格式要求（必须严格遵守） ——",
+            "",
+            *fmt_lines,
+            "",
+            f"层级顺序：{spec}。",
+            "",
+        ]
+        for i, w in enumerate(levels):
+            outro.append(f"LEVEL {i+1}：大约 {w} 字。" + (L1_ZH if i == 0 else LATER_ZH))
+        outro += ["", "现在开始输出（以 `--- LEVEL 1 ---` 开始）。"]
+        return "\n".join(intro + ["", "<source>", src, "</source>"] + outro)
+    else:
+        spec = ", ".join(f"LEVEL {i+1} (~{w}w)" for i, w in enumerate(levels))
+        intro = [
+            "Your task is to produce a 'mipmap' summary of the source below: "
+            "a stack of summaries at progressively larger sizes, smallest first.",
+            "",
+            "The source may contain code, tables, lists, or other structured "
+            "content. Summarize their meaning naturally; do not attempt to "
+            "reproduce them verbatim.",
+        ]
+        if len(levels) >= 2:
+            fmt_lines = [
+                "Your output MUST begin with a line containing exactly `--- LEVEL 1 ---`, "
+                "followed by the LEVEL 1 content. Then a line `--- LEVEL 2 ---`, "
+                "followed by the LEVEL 2 content. And so on. Each delimiter must be "
+                "on its own line. Do NOT reproduce the source's structure (headings, "
+                "tables, lists). Do NOT wrap your output in markdown code fences "
+                "(```), even if the source contains them. Output ONLY the mipmap "
+                "levels separated by these delimiters as plain text.",
+            ]
+        else:
+            fmt_lines = [
+                "Your output MUST begin with a line containing exactly `--- LEVEL 1 ---`, "
+                "followed by the LEVEL 1 content. There is only one level. Do NOT "
+                "reproduce the source's structure (headings, tables, lists). Do NOT "
+                "wrap your output in markdown code fences (```). Output ONLY the "
+                "LEVEL 1 line and its content as plain text.",
+            ]
+        outro = [
+            "",
+            "—— OUTPUT FORMAT (MANDATORY) ——",
+            "",
+            *fmt_lines,
+            "",
+            f"Levels in order: {spec}.",
+            "",
+        ]
+        for i, w in enumerate(levels):
+            outro.append(f"LEVEL {i+1}: approximately {w} words. " + (L1_EN if i == 0 else LATER_EN))
+        outro += ["", "Begin output now (start with `--- LEVEL 1 ---`)."]
+        return "\n".join(intro + ["", "<source>", src, "</source>"] + outro)
+
+# --- ollama streaming --------------------------------------------------------
+
+def stream_raw(endpoint: str, model: str, prompt: str, temperature: float,
+               seed: int | None, num_ctx: int) -> Iterator[str]:
+    options: dict = {"temperature": temperature, "num_ctx": num_ctx}
+    if seed is not None:
+        options["seed"] = seed
+    body = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": True,
+        "options": options,
+        "keep_alive": "10m",
+    }).encode()
+    url = endpoint.rstrip("/") + "/api/generate"
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as r:
+        for line in r:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            chunk = obj.get("response", "")
+            if chunk:
+                yield chunk
+            if obj.get("done"):
+                return
+
+
+def strip_fences(raw_iter: Iterator[str]) -> Iterator[str]:
+    """Drop lone markdown code-fence lines (``` or ```lang) from the stream.
+
+    Buffers chunk-by-chunk into lines; any line that consists only of a
+    fence marker is dropped. Adds at most one line of latency.
+    """
+    buf = ""
+    for chunk in raw_iter:
+        buf += chunk
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            if FENCE_LINE.fullmatch(line):
+                continue
+            yield line + "\n"
+    if buf and not FENCE_LINE.fullmatch(buf):
+        yield buf
+
+def stream_levels(raw_iter: Iterator[str]) -> Iterator[tuple[int, str]]:
+    """Yield (level, content_chunk) pairs. Delimiters suppressed.
+
+    At each level boundary, strips leading whitespace AND any leading
+    markdown horizontal rule (`---`, `***`, `===`, `___`) that some models
+    emit as decoration between the LEVEL marker and the actual content.
+    Rstrips trailing whitespace right before the next delimiter. Inter-line
+    whitespace inside a level is preserved.
+    """
+    accum = ""
+    current = 0  # 0 = preamble before LEVEL 1
+    just_started = False
+    for chunk in raw_iter:
+        accum += chunk
+        while True:
+            m = LVL_DELIM.search(accum)
+            if m is None:
+                # Hold back ~30 chars in case a partial delimiter is forming
+                safe = max(0, len(accum) - 30)
+                if safe > 0 and current > 0:
+                    out = accum[:safe]
+                    if just_started:
+                        out = _strip_level_lead(out)
+                        if out:
+                            just_started = False
+                    if out:
+                        yield current, out
+                accum = accum[safe:]
+                break
+            before = accum[:m.start()]
+            if current > 0 and before:
+                out = before
+                if just_started:
+                    out = _strip_level_lead(out)
+                out = out.rstrip()
+                if out:
+                    yield current, out
+            current = int(m.group(1))
+            just_started = True
+            accum = accum[m.end():]
+    # Final flush
+    if current > 0 and accum:
+        out = accum
+        if just_started:
+            out = _strip_level_lead(out)
+        out = out.rstrip()
+        if out:
+            yield current, out
+
+
+def _strip_level_lead(s: str) -> str:
+    """Remove leading whitespace and any markdown horizontal-rule line that
+    sometimes appears between the LEVEL marker and the actual content."""
+    s = s.lstrip()
+    m = LEADING_HR.match(s)
+    if m:
+        s = s[m.end():].lstrip()
+    return s
+
+# --- formatters --------------------------------------------------------------
+
+class Formatter:
+    def begin(self, levels: list[int]) -> None: ...
+    def emit(self, level: int, chunk: str) -> None: ...
+    def end(self) -> None: ...
+
+class ColorFormatter(Formatter):
+    """Suppresses delimiters; brightness/hue gradient signals the levels."""
+    def __init__(self, mode_256: bool):
+        self.mode_256 = mode_256
+        self.last_level = 0
+
+    def _color(self, level: int) -> str:
+        if self.mode_256:
+            ramp = [255, 252, 248, 244, 240, 236, 232]
+            idx = min(level - 1, len(ramp) - 1)
+            return f"\033[38;5;{ramp[idx]}m"
+        return {1: "\033[1m", 2: "\033[0m"}.get(level, "\033[2m")
+
+    def begin(self, levels: list[int]) -> None:
+        pass
+
+    def emit(self, level: int, chunk: str) -> None:
+        if level != self.last_level:
+            if self.last_level > 0:
+                sys.stdout.write("\033[0m\n\n")
+            sys.stdout.write(self._color(level))
+            self.last_level = level
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+
+    def end(self) -> None:
+        sys.stdout.write("\033[0m\n")
+        sys.stdout.flush()
+
+class JsonlFormatter(Formatter):
+    """One JSON object per completed level."""
+    def __init__(self) -> None:
+        self.buffer: dict[int, str] = {}
+        self.targets: list[int] = []
+
+    def begin(self, levels: list[int]) -> None:
+        self.targets = levels
+
+    def emit(self, level: int, chunk: str) -> None:
+        self.buffer.setdefault(level, "")
+        self.buffer[level] += chunk
+
+    def end(self) -> None:
+        for level in sorted(self.buffer):
+            content = self.buffer[level].strip()
+            if not content:
+                continue
+            target = self.targets[level - 1] if 0 <= level - 1 < len(self.targets) else None
+            actual = sum(count_units(content))
+            obj = {
+                "level": level,
+                "target_words": target,
+                "actual_words": actual,
+                "content": content,
+            }
+            print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+# --- CLI ---------------------------------------------------------------------
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="mipmap",
+        description="Progressive disclosure summarization. Streams a stack of "
+                    "summaries at progressively larger sizes, smallest first. "
+                    "Best on prose (articles, dialogues, AI responses, technical "
+                    "writeups). Highly tabular sources (data lists, reference "
+                    "tables) produce useful TLDRs but flat upper levels because "
+                    "the model won't enumerate table rows during summarization.",
+    )
+    p.add_argument("file", nargs="?", help="input file (default: stdin)")
+    p.add_argument("-m", "--model",
+                   default=os.environ.get("MIPMAP_MODEL", DEFAULT_MODEL))
+    p.add_argument("-e", "--endpoint",
+                   default=os.environ.get("MIPMAP_ENDPOINT", DEFAULT_ENDPOINT))
+    p.add_argument("-f", "--format",
+                   default=os.environ.get("MIPMAP_FORMAT", "plain"),
+                   choices=["plain", "color", "color-256", "jsonl"])
+    p.add_argument("--floor", type=int,
+                   default=(int(os.environ["MIPMAP_FLOOR"]) if os.environ.get("MIPMAP_FLOOR") else None))
+    p.add_argument("-c", "--compression", type=float,
+                   default=float(os.environ.get("MIPMAP_COMPRESSION", DEFAULT_COMPRESSION)))
+    p.add_argument("--max-levels", type=int,
+                   default=int(os.environ.get("MIPMAP_MAX_LEVELS", DEFAULT_MAX_LEVELS)))
+    p.add_argument("-t", "--temperature", type=float,
+                   default=float(os.environ.get("MIPMAP_TEMP", DEFAULT_TEMP)))
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--lang", default="auto", choices=["auto", "en", "zh"])
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="print stderr diagnostic showing source size, level "
+                        "targets, and chosen model")
+    return p.parse_args(argv)
+
+def read_input(path: str | None) -> str:
+    if path is None:
+        if sys.stdin.isatty():
+            sys.stderr.write("mipmap: no input. Pipe text via stdin or pass a file path.\n")
+            sys.exit(2)
+        return sys.stdin.read()
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    if os.environ.get("NO_COLOR") and args.format in ("color", "color-256"):
+        args.format = "plain"
+
+    src = read_input(args.file)
+    if not src.strip():
+        sys.stderr.write("mipmap: input is empty.\n")
+        return 2
+
+    if len(src) > INPUT_CHAR_CAP:
+        # Always warn — silent truncation is data loss the user should know about.
+        sys.stderr.write(
+            f"mipmap: input too long ({len(src)} chars), truncating to {INPUT_CHAR_CAP}.\n"
+        )
+        src = src[:INPUT_CHAR_CAP]
+
+    cjk = is_cjk_dominant(src, args.lang)
+    a, c = count_units(src)
+    units = a + c
+    floor = args.floor if args.floor else (DEFAULT_FLOOR_CJK if cjk else DEFAULT_FLOOR_LATIN)
+    levels = calibrated_levels(units, floor, args.compression, args.max_levels)
+
+    if not levels or (len(levels) == 1 and levels[0] >= units):
+        if args.verbose:
+            sys.stderr.write("mipmap: input too short to summarize, passing through.\n")
+        sys.stdout.write(src)
+        if not src.endswith("\n"):
+            sys.stdout.write("\n")
+        return 0
+
+    if args.verbose:
+        unit_label = "字" if cjk else "words"
+        levels_str = ", ".join(str(w) for w in levels)
+        level_word = "level" if len(levels) == 1 else "levels"
+        sys.stderr.write(
+            f"mipmap: source {units} {unit_label}, computing {len(levels)} "
+            f"{level_word}: {levels_str} ({args.model})\n"
+        )
+
+    prompt = make_prompt(src, levels, cjk)
+
+    try:
+        raw = stream_raw(args.endpoint, args.model, prompt,
+                          args.temperature, args.seed, NUM_CTX)
+        defenced = strip_fences(raw)
+
+        if args.format == "plain":
+            for chunk in defenced:
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+            sys.stdout.write("\n")
+        else:
+            formatter: Formatter
+            if args.format == "color":
+                formatter = ColorFormatter(mode_256=False)
+            elif args.format == "color-256":
+                formatter = ColorFormatter(mode_256=True)
+            else:
+                formatter = JsonlFormatter()
+            formatter.begin(levels)
+
+            raw_buffer: list[str] = []
+            def teeing() -> Iterator[str]:
+                for chunk in defenced:
+                    raw_buffer.append(chunk)
+                    yield chunk
+
+            emitted_any = False
+            try:
+                for level, chunk in stream_levels(teeing()):
+                    formatter.emit(level, chunk)
+                    emitted_any = True
+            finally:
+                formatter.end()
+
+            if not emitted_any:
+                sys.stderr.write(
+                    "mipmap: warning — no levels parsed from model output, "
+                    "emitting raw response instead.\n"
+                )
+                sys.stdout.write("".join(raw_buffer))
+                if raw_buffer and not raw_buffer[-1].endswith("\n"):
+                    sys.stdout.write("\n")
+    except urllib.error.URLError as e:
+        sys.stderr.write(f"mipmap: cannot reach ollama at {args.endpoint}: {e}\n")
+        sys.stderr.write("mipmap: hint — is ollama running? `ollama serve`\n")
+        return 1
+    except KeyboardInterrupt:
+        sys.stdout.write("\n\033[0m")
+        sys.stdout.flush()
+        return 130
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
