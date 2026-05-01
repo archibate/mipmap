@@ -34,7 +34,7 @@ DEFAULT_FLOOR_CJK = 30
 DEFAULT_COMPRESSION = 0.3
 DEFAULT_MAX_LEVELS = 7
 DEFAULT_RATIO = 2.5  # each level is this many times the prior
-DEFAULT_TEMP = 0.4
+DEFAULT_TEMP = 0.1  # near-greedy; stable length distribution across runs
 # When --num-ctx is not given, mipmap queries the model's modelfile via
 # /api/show; this fallback is used only if that query fails.
 FALLBACK_NUM_CTX = 8192
@@ -69,11 +69,10 @@ FENCE_LINE = re.compile(r"\A\s*```\w*\s*\Z")
 def count_units(s: str) -> tuple[int, int]:
     return len(ASCII_WORD.findall(s)), len(CJK_CHAR.findall(s))
 
-def is_cjk_dominant(s: str, override: str = "auto") -> bool:
-    if override == "zh":
-        return True
-    if override == "en":
-        return False
+def is_cjk_dominant(s: str) -> bool:
+    """Source is CJK-dominant if more than half its 'units' are CJK chars.
+    Used internally to pick the default --floor (20 words / 30 chars) and
+    the diagnostic label."""
     a, c = count_units(s)
     return (c / (a + c)) > 0.5 if (a + c) else False
 
@@ -430,8 +429,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         f"fewer mipmap levels overall.")
     p.add_argument("-c", "--compression", type=_unit_fraction,
                    default=float(os.environ.get("MIPMAP_COMPRESSION", DEFAULT_COMPRESSION)),
-                   help=f"largest-level size as a fraction of source (0,1]; "
-                        f"default {DEFAULT_COMPRESSION:g} (15%%)")
+                   help=f"largest-level size as a fraction of source, in "
+                        f"(0,1] (default {DEFAULT_COMPRESSION:g}, "
+                        f"{int(DEFAULT_COMPRESSION*100)}%% of source)")
     p.add_argument("--ratio", type=_positive_ratio,
                    default=float(os.environ.get("MIPMAP_RATIO", DEFAULT_RATIO)),
                    help=f"growth factor between adjacent levels; must be > 1 "
@@ -454,12 +454,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=None,
                    help="random seed for the model; default unset (random). "
                         "Pin a value for reproducible output.")
-    p.add_argument("--lang", default="auto", choices=["auto", "en", "zh"],
-                   help="source language hint; affects only the default "
-                        "--floor (20 words for en / 30 chars for zh) and the "
-                        "diagnostic label. Default 'auto' detects by CJK "
-                        "character ratio; the model auto-responds in the "
-                        "source's language regardless.")
     p.add_argument("--max-chars", type=int,
                    default=(int(os.environ["MIPMAP_MAX_CHARS"])
                             if os.environ.get("MIPMAP_MAX_CHARS") else -1),
@@ -498,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("mipmap: input is empty.\n")
         return 2
 
-    cjk = is_cjk_dominant(src, args.lang)
+    cjk = is_cjk_dominant(src)
 
     # Resolve num_ctx: query the model's modelfile if the user didn't specify.
     num_ctx_source = "explicit"

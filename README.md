@@ -89,9 +89,9 @@ mipmap: source 1247 words, computing 5 levels: 20, 50, 125, 312, 374 (qwen2.5-co
 
 ### 中文支持
 
-支持中文（以及日韩 CJK 文字）。会自动检测源文本的语言——如果 CJK 字符占比超过 50%，自动改用字符计算长度（最短一层默认 30 字）。模型会根据原文语言自动决定输出语言；prompt 本身保持英文，实测对 qwen2.5-coder:14b 的指令遵守度更高，也不会让中文输出沾上翻译腔。
+支持中文（以及日韩 CJK 文字）。无需特别配置——CJK 字符占比超过 50% 时自动按字符计长度（最短一层默认 30 字，英文是 20 词）。如果想覆盖默认，直接 `--floor` 指定即可。
 
-`--lang zh` / `--lang en` 可以强制指定语言（影响最短一层的单位选择）。
+prompt 本身始终是英文（实测对 qwen2.5-coder:14b 的指令遵守度更高，也不会让中文输出沾上翻译腔）；模型会根据原文语言自动决定输出语言。
 
 ```
 $ cat 中文文章.md | mipmap -v
@@ -111,9 +111,8 @@ mipmap: source 1234 字, computing 4 levels: 30, 75, 188, 370 (qwen2.5-coder:14b
 | `--max-levels` | `7` | 自动模式下的层级上限。再长的文本也不会超过 7 层 |
 | `--levels` | auto | 强制指定层级数量。从 `--floor` 开始按 `--ratio` 几何增长，例如 `--levels 3 --floor 20 --ratio 2.5` → `[20, 50, 125]`。指定后会忽略 `--max-levels` 和 `--compression` |
 | `--floor` | 20 / 30 | 最短一层（TLDR）的长度，英文按词、中文按字。默认英文 20 词、中文 30 字。调大就是要一个更"厚"的 TLDR，也会让整体层级数量减少 |
-| `-t`, `--temperature` | `0.4` | 采样温度 |
+| `-t`, `--temperature` | `0.1` | 采样温度，范围 `[0, 2]`。默认 `0.1` 接近 greedy，长度分布更稳定 |
 | `--seed` | 随机 | 固定种子用于复现 |
-| `--lang` | `auto` | 强制语言：`auto` / `en` / `zh` |
 | `--max-chars` | auto | 输入字符上限，超出从尾部截掉；`0` 表示不截。默认按 `--num-ctx` 和语言自动缩放：英文约 `(num_ctx − 3000) × 3`，中文约 `(num_ctx − 3000) × 0.8`，3000 tokens 留给 prompt 和输出 |
 | `--num-ctx` | auto | ollama 上下文窗口（tokens）。默认通过 `/api/show` 查询模型 modelfile 里的 `num_ctx`，查询失败时回落到 8192 |
 | `-v`, `--verbose` | | 打印 stderr 上的层级规划信息（默认安静） |
