@@ -32,6 +32,7 @@ DEFAULT_FLOOR_LATIN = 20
 DEFAULT_FLOOR_CJK = 30
 DEFAULT_COMPRESSION = 0.15
 DEFAULT_MAX_LEVELS = 7
+DEFAULT_RATIO = 2.0  # each level is this many times the prior; mipmap-style doubling
 DEFAULT_TEMP = 0.4
 # When --num-ctx is not given, mipmap queries the model's modelfile via
 # /api/show; this fallback is used only if that query fails.
@@ -77,14 +78,15 @@ def is_cjk_dominant(s: str, override: str = "auto") -> bool:
 
 # --- level computation -------------------------------------------------------
 
-def calibrated_levels(units: int, floor: int, compression: float, cap: int) -> list[int]:
+def calibrated_levels(units: int, floor: int, compression: float, cap: int,
+                       ratio: float = DEFAULT_RATIO) -> list[int]:
     """Return target sizes per level, smallest first.
 
     Behavior by source size:
       units < floor:          [units]   — too short, pass through verbatim
       ceiling < floor:        [floor]   — single TLDR; full mipmap not useful
-      otherwise:              [floor, 2*floor, 4*floor, ..., ceiling]
-    where ceiling = floor(units * compression).
+      otherwise:              [floor, ratio*floor, ratio^2*floor, ..., ceiling]
+    where ceiling = int(units * compression).
     """
     if units <= 0:
         return []
@@ -94,10 +96,11 @@ def calibrated_levels(units: int, floor: int, compression: float, cap: int) -> l
     if ceiling < floor:
         return [floor]
     out: list[int] = []
-    n = floor
-    while n <= ceiling and len(out) < cap:
-        out.append(n)
-        n *= 2
+    n: float = floor
+    while round(n) <= ceiling and len(out) < cap:
+        out.append(round(n))
+        next_n = max(n + 1, n * ratio)  # ensure monotonic growth even at ratio≈1
+        n = next_n
     if out and out[-1] < ceiling and ceiling - out[-1] >= floor and len(out) < cap:
         out.append(ceiling)
     return out
@@ -112,103 +115,63 @@ L1_EN = (
     "outlines/is about'. State the content directly, in your own voice."
 )
 
-LATER_EN = (
-    "REWRITE this level fresh from the source — do NOT extend the prior level "
-    "or copy its sentences. Each level is an independent summary at a new "
-    "target size, not the previous level plus extras. Include facts the prior "
-    "shorter level had to omit, with different wording."
-)
-
-L1_ZH = (
-    "写一句话——只一句，不要用分号或句号拼接两个意思。"
-    "概括原文的主要主张、建议、发现或定义。使用陈述句或祈使句。"
-    "不要用'原文讨论/介绍/探讨/描述/概述/涉及'之类的元描述开头。"
-    "直接陈述内容，用你自己的语气。"
-)
-
-LATER_ZH = (
-    "重新撰写这一层——不要在前一层基础上叠加，也不要复制前一层的句子。"
-    "每一层都是按新的字数目标独立写出的摘要，不是前一层再加内容。"
-    "补充前一层因长度限制未提及的事实，措辞要不同于前一层。"
-)
+def later_instruction(prior_level: int) -> str:
+    return (
+        f"INCLUDE everything from LEVEL {prior_level} (rephrased in fresh "
+        f"wording, not copied verbatim), THEN add more facts, details, "
+        f"examples, or context from the source. Same topics, more depth — "
+        f"do NOT switch to a different section or aspect of the source. "
+        f"The output must be visibly longer than LEVEL {prior_level}."
+    )
 
 def make_prompt(src: str, levels: list[int], cjk: bool) -> str:
-    if cjk:
-        spec = "、".join(f"LEVEL {i+1}（约{w}字）" for i, w in enumerate(levels))
-        intro = [
-            "你的任务是为下面的源文本生成一个 'mipmap' 摘要：一组长度逐级增大的摘要，"
-            "从最短的开始排列。",
-            "",
-            "原文中可能包含代码、表格、列表或其他结构化内容。"
-            "请用自然语言概括其含义，不要逐字复制。",
+    """Build the LLM prompt. Always English-language instructions — the model
+    follows them more reliably than Chinese instructions, and naturally
+    responds in the source's language regardless of the prompt language.
+    The `cjk` flag only affects the per-level unit label (字 vs. words)."""
+    unit_label = "字" if cjk else "w"
+    spec = ", ".join(f"LEVEL {i+1} (~{w}{unit_label})" for i, w in enumerate(levels))
+    intro = [
+        "Your task is to produce a 'mipmap' summary of the source below: "
+        "a stack of summaries at progressively larger sizes, smallest first. "
+        "Respond in the same language as the source.",
+        "",
+        "The source may contain code, tables, lists, or other structured "
+        "content. Summarize their meaning naturally; do not attempt to "
+        "reproduce them verbatim.",
+    ]
+    if len(levels) >= 2:
+        fmt_lines = [
+            "Your output MUST begin with a line containing exactly `--- LEVEL 1 ---`, "
+            "followed by the LEVEL 1 content. Then a line `--- LEVEL 2 ---`, "
+            "followed by the LEVEL 2 content. And so on. Each delimiter must be "
+            "on its own line. Do NOT reproduce the source's structure (headings, "
+            "tables, lists). Do NOT wrap your output in markdown code fences "
+            "(```), even if the source contains them. Output ONLY the mipmap "
+            "levels separated by these delimiters as plain text.",
         ]
-        if len(levels) >= 2:
-            fmt_lines = [
-                f"输出必须以一行 `--- LEVEL 1 ---` 开头，后跟 LEVEL 1 内容。"
-                f"接着一行 `--- LEVEL 2 ---`，后跟 LEVEL 2 内容。依此类推。"
-                "每个分隔符必须独占一行。"
-                "不要把输出包在 markdown 代码块（```）里，即使原文有也不要。"
-                "纯文本输出层级标记和内容即可。",
-            ]
-        else:
-            fmt_lines = [
-                "输出必须以一行 `--- LEVEL 1 ---` 开头，后跟 LEVEL 1 内容。只有一个层级。"
-                "不要把输出包在 markdown 代码块（```）里。纯文本输出即可。",
-            ]
-        outro = [
-            "",
-            "—— 输出格式要求（必须严格遵守） ——",
-            "",
-            *fmt_lines,
-            "",
-            f"层级顺序：{spec}。",
-            "",
-        ]
-        for i, w in enumerate(levels):
-            outro.append(f"LEVEL {i+1}：大约 {w} 字。" + (L1_ZH if i == 0 else LATER_ZH))
-        outro += ["", "现在开始输出（以 `--- LEVEL 1 ---` 开始）。"]
-        return "\n".join(intro + ["", "<source>", src, "</source>"] + outro)
     else:
-        spec = ", ".join(f"LEVEL {i+1} (~{w}w)" for i, w in enumerate(levels))
-        intro = [
-            "Your task is to produce a 'mipmap' summary of the source below: "
-            "a stack of summaries at progressively larger sizes, smallest first.",
-            "",
-            "The source may contain code, tables, lists, or other structured "
-            "content. Summarize their meaning naturally; do not attempt to "
-            "reproduce them verbatim.",
+        fmt_lines = [
+            "Your output MUST begin with a line containing exactly `--- LEVEL 1 ---`, "
+            "followed by the LEVEL 1 content. There is only one level. Do NOT "
+            "reproduce the source's structure (headings, tables, lists). Do NOT "
+            "wrap your output in markdown code fences (```). Output ONLY the "
+            "LEVEL 1 line and its content as plain text.",
         ]
-        if len(levels) >= 2:
-            fmt_lines = [
-                "Your output MUST begin with a line containing exactly `--- LEVEL 1 ---`, "
-                "followed by the LEVEL 1 content. Then a line `--- LEVEL 2 ---`, "
-                "followed by the LEVEL 2 content. And so on. Each delimiter must be "
-                "on its own line. Do NOT reproduce the source's structure (headings, "
-                "tables, lists). Do NOT wrap your output in markdown code fences "
-                "(```), even if the source contains them. Output ONLY the mipmap "
-                "levels separated by these delimiters as plain text.",
-            ]
-        else:
-            fmt_lines = [
-                "Your output MUST begin with a line containing exactly `--- LEVEL 1 ---`, "
-                "followed by the LEVEL 1 content. There is only one level. Do NOT "
-                "reproduce the source's structure (headings, tables, lists). Do NOT "
-                "wrap your output in markdown code fences (```). Output ONLY the "
-                "LEVEL 1 line and its content as plain text.",
-            ]
-        outro = [
-            "",
-            "—— OUTPUT FORMAT (MANDATORY) ——",
-            "",
-            *fmt_lines,
-            "",
-            f"Levels in order: {spec}.",
-            "",
-        ]
-        for i, w in enumerate(levels):
-            outro.append(f"LEVEL {i+1}: approximately {w} words. " + (L1_EN if i == 0 else LATER_EN))
-        outro += ["", "Begin output now (start with `--- LEVEL 1 ---`)."]
-        return "\n".join(intro + ["", "<source>", src, "</source>"] + outro)
+    outro = [
+        "",
+        "—— OUTPUT FORMAT (MANDATORY) ——",
+        "",
+        *fmt_lines,
+        "",
+        f"Levels in order: {spec}.",
+        "",
+    ]
+    for i, w in enumerate(levels):
+        instr = L1_EN if i == 0 else later_instruction(i)
+        outro.append(f"LEVEL {i+1}: approximately {w} {unit_label}. " + instr)
+    outro += ["", "Begin output now (start with `--- LEVEL 1 ---`)."]
+    return "\n".join(intro + ["", "<source>", src, "</source>"] + outro)
 
 # --- ollama streaming --------------------------------------------------------
 
@@ -411,6 +374,34 @@ class JsonlFormatter(Formatter):
 
 # --- CLI ---------------------------------------------------------------------
 
+def _positive_ratio(s: str) -> float:
+    v = float(s)
+    if v <= 1.0:
+        raise argparse.ArgumentTypeError(f"ratio must be > 1.0, got {v}")
+    return v
+
+
+def _positive_int(s: str) -> int:
+    v = int(s)
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {v}")
+    return v
+
+
+def _unit_fraction(s: str) -> float:
+    v = float(s)
+    if not (0.0 < v <= 1.0):
+        raise argparse.ArgumentTypeError(f"must be in (0.0, 1.0], got {v}")
+    return v
+
+
+def _temperature(s: str) -> float:
+    v = float(s)
+    if not (0.0 <= v <= 2.0):
+        raise argparse.ArgumentTypeError(f"must be in [0.0, 2.0], got {v}")
+    return v
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="mipmap",
@@ -429,25 +420,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("-f", "--format",
                    default=os.environ.get("MIPMAP_FORMAT", "plain"),
                    choices=["plain", "color", "color-256", "jsonl"])
-    p.add_argument("--floor", type=int,
+    p.add_argument("--floor", type=_positive_int,
                    default=(int(os.environ["MIPMAP_FLOOR"]) if os.environ.get("MIPMAP_FLOOR") else None),
                    help=f"smallest level's target size in units (words for "
                         f"Latin sources, characters for CJK); default "
                         f"{DEFAULT_FLOOR_LATIN} for Latin / {DEFAULT_FLOOR_CJK} "
                         f"for CJK. Larger values produce a denser TLDR with "
                         f"fewer mipmap levels overall.")
-    p.add_argument("-c", "--compression", type=float,
-                   default=float(os.environ.get("MIPMAP_COMPRESSION", DEFAULT_COMPRESSION)))
-    p.add_argument("--max-levels", type=int,
+    p.add_argument("-c", "--compression", type=_unit_fraction,
+                   default=float(os.environ.get("MIPMAP_COMPRESSION", DEFAULT_COMPRESSION)),
+                   help=f"largest-level size as a fraction of source (0,1]; "
+                        f"default {DEFAULT_COMPRESSION:g} (15%%)")
+    p.add_argument("--ratio", type=_positive_ratio,
+                   default=float(os.environ.get("MIPMAP_RATIO", DEFAULT_RATIO)),
+                   help=f"growth factor between adjacent levels; must be > 1 "
+                        f"(default {DEFAULT_RATIO}, classic mipmap doubling). "
+                        f"Smaller values like 1.5 produce a finer ladder; "
+                        f"larger like 3 jumps faster")
+    p.add_argument("--max-levels", type=_positive_int,
                    default=int(os.environ.get("MIPMAP_MAX_LEVELS", DEFAULT_MAX_LEVELS)),
                    help="cap on auto-computed level count (default "
                         f"{DEFAULT_MAX_LEVELS}); ignored if --levels is set")
-    p.add_argument("--levels", type=int, default=None,
-                   help="force exactly N levels by doubling from --floor "
-                        "(e.g. --levels 3 with default floor=20 → [20, 40, 80]); "
+    p.add_argument("--levels", type=_positive_int, default=None,
+                   help="force exactly N levels (must be > 0) by geometric "
+                        "growth from --floor at --ratio (e.g. --levels 3 "
+                        "with default floor=20 ratio=2 → [20, 40, 80]); "
                         "overrides --max-levels and the auto-compression cap")
-    p.add_argument("-t", "--temperature", type=float,
-                   default=float(os.environ.get("MIPMAP_TEMP", DEFAULT_TEMP)))
+    p.add_argument("-t", "--temperature", type=_temperature,
+                   default=float(os.environ.get("MIPMAP_TEMP", DEFAULT_TEMP)),
+                   help=f"sampling temperature in [0.0, 2.0] "
+                        f"(default {DEFAULT_TEMP:g})")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--lang", default="auto", choices=["auto", "en", "zh"])
     p.add_argument("--max-chars", type=int,
@@ -516,11 +518,12 @@ def main(argv: list[str] | None = None) -> int:
     a, c = count_units(src)
     units = a + c
     floor = args.floor if args.floor else (DEFAULT_FLOOR_CJK if cjk else DEFAULT_FLOOR_LATIN)
-    if args.levels is not None and args.levels > 0:
-        # Explicit override: doubling sequence from floor, exactly N entries.
-        levels = [floor * (2 ** i) for i in range(args.levels)]
+    if args.levels is not None:
+        # Explicit override: geometric sequence from floor, exactly N entries.
+        levels = [round(floor * (args.ratio ** i)) for i in range(args.levels)]
     else:
-        levels = calibrated_levels(units, floor, args.compression, args.max_levels)
+        levels = calibrated_levels(units, floor, args.compression,
+                                    args.max_levels, args.ratio)
 
     if not levels or (len(levels) == 1 and levels[0] >= units):
         if args.verbose:
