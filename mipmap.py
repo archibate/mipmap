@@ -341,20 +341,32 @@ class Formatter:
     def end(self) -> None: ...
 
 class ColorFormatter(Formatter):
-    """Suppresses delimiters; brightness/hue gradient signals the levels."""
+    """Suppresses delimiters; brightness gradient signals the levels.
+
+    color-256 spreads the gradient evenly across the actual level count
+    (so N=3 looks distinct from N=7), bounded from 255 (brightest) to 240
+    (still readable dim gray) — never bottoms out at near-black.
+    """
+    GRAYSCALE_BRIGHT = 255  # near-white
+    GRAYSCALE_DIM = 240     # readable dim gray; stays visible on dark terms
+
     def __init__(self, mode_256: bool):
         self.mode_256 = mode_256
         self.last_level = 0
+        self.n_levels = 1
 
     def _color(self, level: int) -> str:
         if self.mode_256:
-            ramp = [255, 252, 248, 244, 240, 236, 232]
-            idx = min(level - 1, len(ramp) - 1)
-            return f"\033[38;5;{ramp[idx]}m"
+            if self.n_levels <= 1:
+                return f"\033[38;5;{self.GRAYSCALE_BRIGHT}m"
+            idx = min(level - 1, self.n_levels - 1)
+            step = (self.GRAYSCALE_BRIGHT - self.GRAYSCALE_DIM) / (self.n_levels - 1)
+            gray = round(self.GRAYSCALE_BRIGHT - idx * step)
+            return f"\033[38;5;{gray}m"
         return {1: "\033[1m", 2: "\033[0m"}.get(level, "\033[2m")
 
     def begin(self, levels: list[int]) -> None:
-        pass
+        self.n_levels = len(levels)
 
     def emit(self, level: int, chunk: str) -> None:
         if level != self.last_level:
