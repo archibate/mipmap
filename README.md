@@ -111,13 +111,38 @@ mipmap: source 1234 字, computing 4 levels: 30, 60, 120, 185 (qwen2.5-coder:14b
 | `-f`, `--format` | `plain` | 输出格式：`plain` / `color` / `color-256` / `jsonl` |
 | `-c`, `--compression` | `0.15` | 最长一层的压缩比，默认源文本的 15% |
 | `--max-levels` | `7` | 层级上限。再长的文本也不会超过 7 层 |
-| `--floor` | 20 / 30 | 最短一层的长度，英文按词、中文按字 |
+| `--floor` | 20 / 30 | 最短一层（TLDR）的长度，英文按词、中文按字。默认英文 20 词、中文 30 字。调大就是要一个更"厚"的 TLDR，也会让整体层级数量减少 |
 | `-t`, `--temperature` | `0.4` | 采样温度 |
 | `--seed` | 随机 | 固定种子用于复现 |
 | `--lang` | `auto` | 强制语言：`auto` / `en` / `zh` |
+| `--max-chars` | auto | 输入字符上限，超出从尾部截掉；`0` 表示不截。默认按 `--num-ctx` 和语言自动缩放：英文约 `(num_ctx − 3000) × 3`，中文约 `(num_ctx − 3000) × 0.8`，3000 tokens 留给 prompt 和输出 |
+| `--num-ctx` | auto | ollama 上下文窗口（tokens）。默认通过 `/api/show` 查询模型 modelfile 里的 `num_ctx`，查询失败时回落到 8192 |
 | `-v`, `--verbose` | | 打印 stderr 上的层级规划信息（默认安静） |
 
-环境变量也能设默认值：`MIPMAP_MODEL` / `MIPMAP_ENDPOINT` / `MIPMAP_FORMAT` / `MIPMAP_COMPRESSION` 等。`NO_COLOR=1` 会自动把 color 模式降级为 plain（遵循 [no-color.org](https://no-color.org) 约定）。
+环境变量也能设默认值：`MIPMAP_MODEL` / `MIPMAP_ENDPOINT` / `MIPMAP_FORMAT` / `MIPMAP_COMPRESSION` / `MIPMAP_MAX_CHARS` / `MIPMAP_NUM_CTX` 等。`NO_COLOR=1` 会自动把 color 模式降级为 plain（遵循 [no-color.org](https://no-color.org) 约定）。
+
+### 关于 num_ctx
+
+`num_ctx` 是模型一次能处理的总 token 数，**包括输入和输出**。它是一个全局上限，不是单独限制其中一项。
+
+mipmap 默认不写死 `num_ctx`，而是启动时通过 `/api/show` 查询模型 modelfile 里的设置——单一来源就是 ollama 的 modelfile。想调大调小，编辑 modelfile 即可：
+
+```bash
+ollama show qwen2.5-coder:14b --modelfile > /tmp/Modelfile
+echo 'PARAMETER num_ctx 16384' >> /tmp/Modelfile
+ollama create qwen2.5-coder:14b -f /tmp/Modelfile
+```
+
+也可以用 `--num-ctx` 一次性覆盖。查询失败时回落到 8192。
+
+`--max-chars` 默认会根据 `num_ctx` 和检测到的语言自动算出：
+
+- 英文（拉丁字符）：tokenizer 大约 3-4 字符一个 token，char 上限可以比较宽
+- 中文/日韩（CJK）：基本一个字一个 token，char 上限要相应地小很多
+
+公式：`(num_ctx − 3000) × 3`（英文）或 `(num_ctx − 3000) × 0.8`（中文），3000 tokens 留给 prompt 和输出。例如 `num_ctx=16384` 时，英文上限约 40000 字符，中文约 10000 字。
+
+注意：把 `num_ctx` 设到模型原生上下文之外会触发 ollama 的 RoPE 放缩，attention 质量会下降——qwen2.5-coder:14b 原生支持到 32K。
 
 ## 工作原理
 
@@ -138,7 +163,7 @@ prompt 里有几个关键设计：
 ## 已知限制
 
 - **数据表格主导的文本不太合适**。模型在高密度数据列表上（比如一份 200 行的工具列表）会压成一段笼统描述，不会枚举具体条目。这种输入拿到的是一个好用的 TLDR，加上几层几乎重复的扩写。
-- **大输入会被截断**。超过约 24000 字符的源文本会从末尾截掉，stderr 会有提示。本地小模型 8K context 的折中。
+- **大输入会被截断**。超出 `--max-chars` 的源文本会从末尾截掉（默认按从 modelfile 查到的 `num_ctx` 自动算，英文每 token 算 3 字符，中文每 token 算 0.8 字符），stderr 会有提示。想处理更大输入，把 modelfile 的 `num_ctx` 调大，或者用 `--num-ctx` 直接覆盖。
 - **字数目标不严格满足**。模型对"约 N 字"的执行力不完美——通常会偏小 30-50%（在信息密度有限的源文本上更明显）。当作目标提示，不是硬约束。
 
 ## 致谢

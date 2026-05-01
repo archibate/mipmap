@@ -33,8 +33,19 @@ DEFAULT_FLOOR_CJK = 30
 DEFAULT_COMPRESSION = 0.15
 DEFAULT_MAX_LEVELS = 7
 DEFAULT_TEMP = 0.4
-INPUT_CHAR_CAP = 24000
-NUM_CTX = 8192
+# When --num-ctx is not given, mipmap queries the model's modelfile via
+# /api/show; this fallback is used only if that query fails.
+FALLBACK_NUM_CTX = 8192
+# --max-chars defaults to auto: ~num_ctx*3 for Latin, ~num_ctx*0.8 for CJK
+# (CJK tokenizes 1 char ≈ 1 token; Latin is ~3-4 chars per token)
+LATIN_CHARS_PER_TOKEN = 3.0
+CJK_CHARS_PER_TOKEN = 0.8
+# Tokens reserved for prompt scaffolding + output budget when computing
+# max-chars. Adaptive: ~25% of context with a 1500-token floor so small-ctx
+# models don't get squeezed (e.g. at num_ctx=4096 we only reserve 1500, not
+# the full 3000 a fixed budget would force).
+def reserved_tokens_for(num_ctx: int) -> int:
+    return max(1500, num_ctx // 4)
 
 # --- counters & detection ----------------------------------------------------
 
@@ -200,6 +211,24 @@ def make_prompt(src: str, levels: list[int], cjk: bool) -> str:
         return "\n".join(intro + ["", "<source>", src, "</source>"] + outro)
 
 # --- ollama streaming --------------------------------------------------------
+
+NUM_CTX_RE = re.compile(r"^\s*num_ctx\s+(\d+)\s*$", re.MULTILINE)
+
+def query_model_num_ctx(endpoint: str, model: str, timeout: float = 2.0) -> int | None:
+    """Ask ollama what num_ctx is set in the modelfile. Returns None on any
+    failure (server unreachable, model missing, num_ctx not specified)."""
+    body = json.dumps({"name": model}).encode()
+    url = endpoint.rstrip("/") + "/api/show"
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return None
+    params = data.get("parameters", "")
+    m = NUM_CTX_RE.search(params)
+    return int(m.group(1)) if m else None
+
 
 def stream_raw(endpoint: str, model: str, prompt: str, temperature: float,
                seed: int | None, num_ctx: int) -> Iterator[str]:
@@ -389,7 +418,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    default=os.environ.get("MIPMAP_FORMAT", "plain"),
                    choices=["plain", "color", "color-256", "jsonl"])
     p.add_argument("--floor", type=int,
-                   default=(int(os.environ["MIPMAP_FLOOR"]) if os.environ.get("MIPMAP_FLOOR") else None))
+                   default=(int(os.environ["MIPMAP_FLOOR"]) if os.environ.get("MIPMAP_FLOOR") else None),
+                   help=f"smallest level's target size in units (words for "
+                        f"Latin sources, characters for CJK); default "
+                        f"{DEFAULT_FLOOR_LATIN} for Latin / {DEFAULT_FLOOR_CJK} "
+                        f"for CJK. Larger values produce a denser TLDR with "
+                        f"fewer mipmap levels overall.")
     p.add_argument("-c", "--compression", type=float,
                    default=float(os.environ.get("MIPMAP_COMPRESSION", DEFAULT_COMPRESSION)))
     p.add_argument("--max-levels", type=int,
@@ -398,6 +432,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    default=float(os.environ.get("MIPMAP_TEMP", DEFAULT_TEMP)))
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--lang", default="auto", choices=["auto", "en", "zh"])
+    p.add_argument("--max-chars", type=int,
+                   default=(int(os.environ["MIPMAP_MAX_CHARS"])
+                            if os.environ.get("MIPMAP_MAX_CHARS") else -1),
+                   help="truncate input above this many chars; 0 disables; "
+                        "default auto-scales with --num-ctx and detected language "
+                        f"(~num_ctx*{LATIN_CHARS_PER_TOKEN:g} for Latin, "
+                        f"~num_ctx*{CJK_CHARS_PER_TOKEN:g} for CJK)")
+    p.add_argument("--num-ctx", type=int,
+                   default=(int(os.environ["MIPMAP_NUM_CTX"])
+                            if os.environ.get("MIPMAP_NUM_CTX") else -1),
+                   help="ollama context window in tokens; default queries the "
+                        "model's modelfile via /api/show, falling back to "
+                        f"{FALLBACK_NUM_CTX} if the query fails")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="print stderr diagnostic showing source size, level "
                         "targets, and chosen model")
@@ -423,14 +470,31 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("mipmap: input is empty.\n")
         return 2
 
-    if len(src) > INPUT_CHAR_CAP:
+    cjk = is_cjk_dominant(src, args.lang)
+
+    # Resolve num_ctx: query the model's modelfile if the user didn't specify.
+    num_ctx_source = "explicit"
+    if args.num_ctx < 0:
+        detected = query_model_num_ctx(args.endpoint, args.model)
+        if detected is not None:
+            args.num_ctx = detected
+            num_ctx_source = f"modelfile ({args.model})"
+        else:
+            args.num_ctx = FALLBACK_NUM_CTX
+            num_ctx_source = "fallback"
+
+    if args.max_chars < 0:
+        # Auto-scale based on language and num_ctx.
+        per_token = CJK_CHARS_PER_TOKEN if cjk else LATIN_CHARS_PER_TOKEN
+        budget_tokens = max(1000, args.num_ctx - reserved_tokens_for(args.num_ctx))
+        args.max_chars = int(budget_tokens * per_token)
+
+    if args.max_chars > 0 and len(src) > args.max_chars:
         # Always warn — silent truncation is data loss the user should know about.
         sys.stderr.write(
-            f"mipmap: input too long ({len(src)} chars), truncating to {INPUT_CHAR_CAP}.\n"
+            f"mipmap: input too long ({len(src)} chars), truncating to {args.max_chars}.\n"
         )
-        src = src[:INPUT_CHAR_CAP]
-
-    cjk = is_cjk_dominant(src, args.lang)
+        src = src[:args.max_chars]
     a, c = count_units(src)
     units = a + c
     floor = args.floor if args.floor else (DEFAULT_FLOOR_CJK if cjk else DEFAULT_FLOOR_LATIN)
@@ -450,14 +514,15 @@ def main(argv: list[str] | None = None) -> int:
         level_word = "level" if len(levels) == 1 else "levels"
         sys.stderr.write(
             f"mipmap: source {units} {unit_label}, computing {len(levels)} "
-            f"{level_word}: {levels_str} ({args.model})\n"
+            f"{level_word}: {levels_str} "
+            f"({args.model}, num_ctx={args.num_ctx} from {num_ctx_source})\n"
         )
 
     prompt = make_prompt(src, levels, cjk)
 
     try:
         raw = stream_raw(args.endpoint, args.model, prompt,
-                          args.temperature, args.seed, NUM_CTX)
+                          args.temperature, args.seed, args.num_ctx)
         defenced = strip_fences(raw)
 
         if args.format == "plain":
